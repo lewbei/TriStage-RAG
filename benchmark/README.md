@@ -31,7 +31,7 @@ The benchmark will automatically download both the dataset and required models i
 Or install the specific MTEB version explicitly
 
 ```cmd
-pip install "mteb==2.0.0"
+pip install "mteb==2.0.1"
 ```
 
 Notes
@@ -41,7 +41,7 @@ Notes
 Alternatively, install from the v2.0.0 tag
 
 ```cmd
-pip install git+https://github.com/embeddings-benchmark/mteb@v2.0.0
+pip install git+https://github.com/embeddings-benchmark/mteb@2.0.1
 ```
 
 ### GPU (CUDA) acceleration
