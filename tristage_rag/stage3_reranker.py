@@ -7,10 +7,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from sentence_transformers import CrossEncoder
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import math
-from concurrent.futures import ThreadPoolExecutor
-import warnings
-warnings.filterwarnings('ignore')
+from .base_stage import BaseStage
+from .utils import resolve_model_path
 
 @dataclass
 class Stage3Config:
@@ -24,44 +22,48 @@ class Stage3Config:
     use_gpu_if_available: bool = True
     activation_fxn: str = "sigmoid"  # "sigmoid" or "softmax"
     normalize_scores: bool = True
+    # Early-exit: skip cross-encoder when Stage 2 scores already separate results
+    early_exit_enabled: bool = True
+    early_exit_threshold: float = 0.15  # min gap between top-1 and median score
+    early_exit_min_candidates: int = 10  # always rerank at least this many
 
-class CrossEncoderReranker:
-    """Stage 3: Cross-Encoder Reranker for final document ranking"""
-    
+class CrossEncoderReranker(BaseStage):
+    """Stage 3: Cross-Encoder Reranker with optional early exit.
+
+    When ``early_exit_enabled`` is True the reranker checks whether Stage 2
+    scores already produce a clear separation.  If the gap between the top
+    score and the median of the top-K candidates exceeds
+    ``early_exit_threshold``, the cross-encoder is skipped entirely and the
+    Stage 2 ranking is returned as-is.
+    """
+
     def __init__(self, config: Stage3Config):
+        super().__init__()
         self.config = config
-        self.logger = logging.getLogger(__name__)
-        
+
         # Initialize model
         self.model = None
         self.tokenizer = None
-        self.device = self._get_device()
-        
+        self.device = self._init_device(config.device, getattr(config, 'use_gpu_if_available', True))
+
+        # Last-call introspection: True iff the most recent rerank() call took
+        # the early-exit branch. Read by RetrievalPipeline to avoid inferring
+        # early-exit from result contents (which is fragile when Stage 3 returns
+        # [] for unrelated reasons).
+        self.last_early_exit = False
+
         # Load model
         self._load_model()
-    
-    def _get_device(self) -> str:
-        """Determine the best device for inference"""
-        if self.config.device == "auto":
-            if torch.cuda.is_available() and self.config.use_gpu_if_available:
-                return "cuda"  # Try GPU first
-            else:
-                return "cpu"
-        else:
-            return self.config.device
-    
+
     def _load_model(self):
         """Load the cross-encoder model"""
         try:
             self.logger.info(f"Loading Stage 3 model: {self.config.model_name}")
-            
+
+            model_source = resolve_model_path(self.config.model_name, self.config.cache_dir)
+
             # Try to load as CrossEncoder first (preferred)
             try:
-                import os
-                base_dir = os.path.join(self.config.cache_dir, os.path.basename(self.config.model_name))
-                legacy_dir = os.path.join(self.config.cache_dir, self.config.model_name)
-                local_model_dir = base_dir if os.path.isdir(base_dir) else (legacy_dir if os.path.isdir(legacy_dir) else None)
-                model_source = local_model_dir or self.config.model_name
                 self.model = CrossEncoder(
                     model_source,
                     device=self.device,
@@ -110,103 +112,71 @@ class CrossEncoderReranker:
             self.logger.error(f"Error loading Stage 3 model: {e}")
             raise
     
-    def _prepare_input_pairs(self, query: str, documents: List[str]) -> List[Tuple[str, str]]:
-        """Prepare query-document pairs for cross-encoder"""
-        pairs = []
-        for doc in documents:
-            pairs.append((query, doc))
-        return pairs
-    
-    def _predict_with_sentence_transformers(self, pairs: List[Tuple[str, str]]) -> List[float]:
-        """Predict using SentenceTransformers CrossEncoder"""
-        try:
-            # Convert to list of lists format expected by CrossEncoder
-            sentence_pairs = [[query, doc] for query, doc in pairs]
-            
-            # Predict scores
-            scores = self.model.predict(
-                sentence_pairs,
-                batch_size=self.config.batch_size,
-                show_progress_bar=False
-            )
-            
-            return scores.tolist()
-            
-        except Exception as e:
-            self.logger.error(f"Error with SentenceTransformers CrossEncoder: {e}")
-            raise
-    
-    def _predict_with_huggingface(self, pairs: List[Tuple[str, str]]) -> List[float]:
-        """Predict using HuggingFace AutoModel"""
-        all_scores = []
-        
-        # Process in batches
-        for i in range(0, len(pairs), self.config.batch_size):
-            batch_pairs = pairs[i:i + self.config.batch_size]
-            
-            # Tokenize the batch
-            queries = [pair[0] for pair in batch_pairs]
-            documents = [pair[1] for pair in batch_pairs]
-            
+    def _predict_with_huggingface(self, queries: List[str], documents: List[str],
+                                  batch_size: Optional[int] = None) -> List[float]:
+        """Predict using HuggingFace AutoModel.
+
+        ``batch_size`` overrides ``self.config.batch_size`` for this call only
+        (used by the adaptive reranker) without mutating shared config state.
+        """
+        bs = batch_size if batch_size is not None else self.config.batch_size
+        all_score_tensors = []
+
+        for i in range(0, len(queries), bs):
+            batch_queries = queries[i:i + bs]
+            batch_docs = documents[i:i + bs]
+
             encoded = self.tokenizer(
-                queries,
-                documents,
-                truncation=True,
-                padding=True,
+                batch_queries, batch_docs,
+                truncation=True, padding=True,
                 max_length=self.config.max_length,
                 return_tensors="pt"
             )
-            
             encoded = {k: v.to(self.device) for k, v in encoded.items()}
-            
-            # Predict scores
+
             with torch.no_grad():
                 if self.use_amp:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs = self.model(**encoded)
                 else:
                     outputs = self.model(**encoded)
-            
-                # Get logits and apply activation
+
                 logits = outputs.logits
-                
                 if self.config.activation_fxn == "sigmoid":
                     scores = torch.sigmoid(logits).squeeze(-1)
-                else:  # softmax
-                    scores = F.softmax(logits, dim=-1)[:, 1]  # Probability of positive class
-                
-                batch_scores = scores.cpu().tolist()
-                all_scores.extend(batch_scores)
-            
-            # Clear GPU memory if needed
-            if self.device == "cuda" and i % (self.config.batch_size * 2) == 0:
-                try:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except AttributeError:
-                    # torch.cuda not available
-                    pass
-        
-        return all_scores
+                else:
+                    scores = F.softmax(logits, dim=-1)[:, 1]
+
+                all_score_tensors.append(scores.cpu())
+
+        return torch.cat(all_score_tensors).tolist() if all_score_tensors else []
     
-    def predict(self, query: str, documents: List[str]) -> List[float]:
-        """Predict relevance scores for query-document pairs"""
+    def predict(self, query: str, documents: List[str],
+                batch_size: Optional[int] = None) -> List[float]:
+        """Predict relevance scores for query-document pairs.
+
+        ``batch_size`` overrides ``self.config.batch_size`` for this call only
+        (used by the adaptive reranker) without mutating shared config state.
+        """
         if not documents:
             return []
-        
-        # Prepare input pairs
-        pairs = self._prepare_input_pairs(query, documents)
-        
-        # Predict based on model type
+
+        bs = batch_size if batch_size is not None else self.config.batch_size
+        queries = [query] * len(documents)
+
         if self.use_sentence_transformers:
-            scores = self._predict_with_sentence_transformers(pairs)
+            sentence_pairs = [[query, doc] for doc in documents]
+            scores = self.model.predict(
+                sentence_pairs,
+                batch_size=bs,
+                show_progress_bar=False
+            ).tolist()
         else:
-            scores = self._predict_with_huggingface(pairs)
-        
-        # Normalize scores if requested
+            scores = self._predict_with_huggingface(queries, documents, batch_size=bs)
+
         if self.config.normalize_scores:
             scores = self._normalize_scores(scores)
-        
+
         return scores
     
     def _normalize_scores(self, scores: List[float]) -> List[float]:
@@ -216,7 +186,6 @@ class CrossEncoderReranker:
         
         scores_array = np.array(scores)
         
-        # Min-max normalization
         min_score = scores_array.min()
         max_score = scores_array.max()
         
@@ -226,41 +195,93 @@ class CrossEncoderReranker:
             normalized = np.zeros_like(scores_array)
         
         return normalized.tolist()
-    
-    def rerank(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Rerank candidates using cross-encoder"""
+
+    # ------------------------------------------------------------------
+    # Early exit logic
+    # ------------------------------------------------------------------
+
+    def _should_early_exit(self, candidates: List[Dict[str, Any]]) -> bool:
+        """Return True if Stage 2 scores clearly separate the top candidates.
+
+        Heuristic: if ``top1_score - median_score > threshold`` the cross-encoder
+        is unlikely to change the ranking meaningfully.
+        """
+        if not self.config.early_exit_enabled:
+            return False
+
+        if len(candidates) < self.config.early_exit_min_candidates:
+            return False
+
+        scores = [c.get("stage2_score", 0.0) for c in candidates]
+        if not scores:
+            return False
+
+        top1 = max(scores)
+        median = float(np.median(scores))
+        gap = top1 - median
+
+        should_exit = gap > self.config.early_exit_threshold
+        if should_exit:
+            self.logger.info(
+                f"Early exit triggered: top1={top1:.4f} median={median:.4f} gap={gap:.4f} "
+                f"> threshold={self.config.early_exit_threshold}"
+            )
+        return should_exit
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def rerank(self, query: str, candidates: List[Dict[str, Any]],
+               batch_size: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Rerank candidates using cross-encoder.
+
+        If early exit is enabled and Stage 2 scores already separate the
+        candidates clearly, the cross-encoder is skipped and the Stage 2
+        ranking is returned unchanged.
+
+        ``batch_size`` overrides ``self.config.batch_size`` for this call only
+        (used by the adaptive reranker) without mutating shared config state.
+        """
         if not candidates:
+            self.last_early_exit = False
             return []
-        
+
         self.logger.info(f"Reranking {len(candidates)} candidates with Stage 3")
-        
-        # Extract documents from candidates
+
+        # --- Early exit check ---
+        if self._should_early_exit(candidates):
+            candidates.sort(key=lambda x: x.get("stage2_score", 0.0), reverse=True)
+            top_k = candidates[: self.config.top_k_final]
+            self.logger.info(
+                f"Stage 3 early exit: returning top {len(top_k)} from Stage 2 ranking"
+            )
+            self.last_early_exit = True
+            return top_k
+
+        # --- Full cross-encoder reranking ---
+        self.last_early_exit = False
         documents = [candidate["document"] for candidate in candidates]
-        
-        # Get relevance scores
+
         try:
-            scores = self.predict(query, documents)
+            scores = self.predict(query, documents, batch_size=batch_size)
         except Exception as e:
             self.logger.error(f"Error reranking: {e}")
-            # Fallback: return original candidates sorted by previous scores
             return candidates
-        
-        # Update candidates with new scores
-        reranked_candidates = []
-        for i, (candidate, score) in enumerate(zip(candidates, scores)):
-            updated_candidate = candidate.copy()
-            updated_candidate["stage3_score"] = score
-            updated_candidate["stage"] = "stage3"
-            reranked_candidates.append(updated_candidate)
-        
-        # Sort by Stage 3 score (descending)
-        reranked_candidates.sort(key=lambda x: x["stage3_score"], reverse=True)
-        
-        # Keep top-k final results
-        final_results = reranked_candidates[:self.config.top_k_final]
-        
-        self.logger.info(f"Stage 3 reranking completed. Top score: {final_results[0]['stage3_score'] if final_results else 0:.4f}")
-        
+
+        # Update candidates in-place
+        for candidate, score in zip(candidates, scores):
+            candidate["stage3_score"] = score
+            candidate["stage"] = "stage3"
+
+        # Sort and take top-k
+        candidates.sort(key=lambda x: x["stage3_score"], reverse=True)
+        final_results = candidates[:self.config.top_k_final]
+
+        self.logger.info(
+            f"Stage 3 reranking completed. Top score: "
+            f"{final_results[0]['stage3_score'] if final_results else 0:.4f}"
+        )
         return final_results
     
     def batch_rerank(self, queries: List[str], candidates_list: List[List[Dict[str, Any]]]) -> List[List[Dict[str, Any]]]:
@@ -288,7 +309,9 @@ class CrossEncoderReranker:
             "use_fp16": self.use_amp,
             "activation_function": self.config.activation_fxn,
             "normalize_scores": self.config.normalize_scores,
-            "top_k_final": self.config.top_k_final
+            "top_k_final": self.config.top_k_final,
+            "early_exit_enabled": self.config.early_exit_enabled,
+            "early_exit_threshold": self.config.early_exit_threshold,
         }
         
         if self.use_sentence_transformers:
@@ -298,70 +321,42 @@ class CrossEncoderReranker:
             info["num_labels"] = self.model.num_labels if self.model else None
         
         return info
-    
-    def clear_gpu_memory(self):
-        """Clear GPU memory if using CUDA"""
-        if self.device == "cuda":
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except (ImportError, AttributeError):
-                # torch or torch.cuda not available during cleanup
-                pass
-    
-    def __del__(self):
-        """Cleanup when object is destroyed"""
-        try:
-            self.clear_gpu_memory()
-        except:
-            # Silently ignore cleanup errors during object destruction
-            pass
+
 
 class AdaptiveCrossEncoderReranker(CrossEncoderReranker):
     """Adaptive reranker that adjusts batch size based on input length"""
     
     def __init__(self, config: Stage3Config):
         super().__init__(config)
-        self.max_text_length = config.max_length // 2  # Reserve space for both query and document
+        self.max_text_length = config.max_length // 2
     
     def _adaptive_batch_size(self, texts: List[str]) -> int:
         """Determine optimal batch size based on text lengths"""
         if not texts:
             return self.config.batch_size
         
-        # Calculate average text length
         avg_length = sum(len(text.split()) for text in texts) / len(texts)
         
-        # Adjust batch size based on average length
         if avg_length > 200:
             return max(4, self.config.batch_size // 4)
         elif avg_length > 100:
             return max(8, self.config.batch_size // 2)
         elif avg_length > 50:
-            return max(16, self.config.batch_size // 1)
+            return max(16, self.config.batch_size)
         else:
             return self.config.batch_size
     
     def rerank(self, query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Rerank with adaptive batch sizing"""
+        """Rerank with adaptive batch sizing.
+
+        Picks a batch size based on average document length and passes it down
+        to ``predict`` as a per-call override — the shared ``self.config`` is
+        never mutated, so this is safe under concurrent access.
+        """
         if not candidates:
             return []
-        
-        # Extract documents
+
         documents = [candidate["document"] for candidate in candidates]
-        
-        # Calculate adaptive batch size
         adaptive_batch_size = self._adaptive_batch_size([query] + documents)
-        
-        # Temporarily adjust batch size
-        original_batch_size = self.config.batch_size
-        self.config.batch_size = adaptive_batch_size
-        
-        try:
-            result = super().rerank(query, candidates)
-        finally:
-            # Restore original batch size
-            self.config.batch_size = original_batch_size
-        
-        return result
+
+        return super().rerank(query, candidates, batch_size=adaptive_batch_size)

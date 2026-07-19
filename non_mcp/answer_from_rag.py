@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 import argparse
 
-# Ensure repo root on path
+# Allow running directly without `pip install -e .`; no-op once installed.
 THIS = Path(__file__).resolve()
 ROOT = THIS.parents[1]
 if str(ROOT) not in sys.path:

@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import argparse
 
-# Ensure non_mcp/main.py importable
+# Allow running directly without `pip install -e .`; no-op once installed.
 THIS = Path(__file__).resolve()
-sys.path.append(str(THIS.parents[1]))
+_REPO_ROOT = THIS.parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from non_mcp.main import AppConfig, ThreeStageRetrievalSystem
 

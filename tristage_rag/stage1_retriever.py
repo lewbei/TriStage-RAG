@@ -2,16 +2,16 @@ import os
 import json
 import pickle
 import logging
+import math
 import numpy as np
 import faiss
-from typing import List, Dict, Any, Optional, Tuple, Union
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
 import torch
 from collections import defaultdict
-import re
-from concurrent.futures import ThreadPoolExecutor
-import math
+from .utils import resolve_model_path, get_device, BM25_TOKENIZER
+from .base_stage import BaseStage
 
 @dataclass
 class Stage1Config:
@@ -21,7 +21,6 @@ class Stage1Config:
     index_dir: str = "./faiss_index"
     top_k_candidates: int = 500
     batch_size: int = 32
-    max_text_length: int = 512
     enable_bm25: bool = True
     bm25_top_k: int = 300
     fusion_method: str = "rrf"  # "rrf" (Reciprocal Rank Fusion) or "weighted"
@@ -29,66 +28,67 @@ class Stage1Config:
     dense_weight: float = 0.7
     bm25_weight: float = 0.3
     use_fp16: bool = True
-    nlist: int = 100  # FAISS IVF clusters
-    nprobe: int = 10  # FAISS search probes
+    # FAISS index settings — HNSW for 10k+, Flat for smaller
+    hnsw_m: int = 32           # HNSW connections per vector
+    hnsw_ef_search: int = 128  # HNSW search-time precision
+    hnsw_ef_construction: int = 200  # HNSW build-time precision
+    hnsw_threshold: int = 10_000  # Switch from Flat to HNSW at this size
 
 class BM25Index:
-    """Simple BM25 index implementation for document retrieval"""
-    
+    """BM25 index with inverted index for fast query-time retrieval."""
+
     def __init__(self, k1: float = 1.2, b: float = 0.75):
         self.k1 = k1
         self.b = b
         self.doc_freqs = []
         self.idf = {}
         self.doc_lens = []
-        self.avg_doc_len = 0
+        self.avg_doc_len = 0.0
         self.corpus_size = 0
-        self.vocabulary = set()
         self.documents = []
-        
+        # Inverted index: token -> list of (doc_idx, term_freq)
+        self.inverted_index: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+
     def tokenize(self, text: str) -> List[str]:
-        """Simple tokenization for BM25"""
         text = text.lower()
-        text = re.sub(r'[^a-z0-9\s]', ' ', text)
-        tokens = text.split()
-        return tokens
-    
+        text = BM25_TOKENIZER.sub(' ', text)
+        return text.split()
+
     def fit(self, documents: List[str]):
-        """Fit BM25 index on documents"""
         self.documents = documents
         self.corpus_size = len(documents)
-        
-        # Tokenize all documents and calculate document frequencies
-        tokenized_docs = []
-        for doc in documents:
+        self.doc_freqs.clear()
+        self.doc_lens.clear()
+        self.inverted_index.clear()
+        idf_counts: Dict[str, int] = defaultdict(int)
+
+        for doc_idx, doc in enumerate(documents):
             tokens = self.tokenize(doc)
-            tokenized_docs.append(tokens)
-            self.vocabulary.update(tokens)
-            
-            # Calculate term frequencies for this document
-            term_freq = defaultdict(int)
+            self.doc_lens.append(len(tokens))
+
+            term_freq: Dict[str, int] = defaultdict(int)
             for token in tokens:
                 term_freq[token] += 1
-            
+
             self.doc_freqs.append(term_freq)
-            self.doc_lens.append(len(tokens))
-        
-        self.avg_doc_len = sum(self.doc_lens) / self.corpus_size if self.corpus_size > 0 else 0
-        
-        # Calculate IDF scores
-        for token in self.vocabulary:
-            df = sum(1 for doc_freq in self.doc_freqs if token in doc_freq)
+
+            # Build inverted index and count document frequency in one pass
+            seen_tokens = set()
+            for token, tf in term_freq.items():
+                self.inverted_index[token].append((doc_idx, tf))
+                if token not in seen_tokens:
+                    idf_counts[token] += 1
+                    seen_tokens.add(token)
+
+        self.avg_doc_len = sum(self.doc_lens) / self.corpus_size if self.corpus_size > 0 else 0.0
+
+        # Compute IDF from document frequency counts
+        for token, df in idf_counts.items():
             self.idf[token] = math.log((self.corpus_size - df + 0.5) / (df + 0.5) + 1.0)
-    
-    def score(self, query: str, doc_idx: int) -> float:
-        """Calculate BM25 score for query against document"""
-        if doc_idx >= len(self.doc_freqs):
-            return 0.0
-            
-        query_tokens = self.tokenize(query)
+
+    def _score_doc(self, query_tokens: List[str], doc_idx: int) -> float:
         doc_freq = self.doc_freqs[doc_idx]
         doc_len = self.doc_lens[doc_idx]
-        
         score = 0.0
         for token in query_tokens:
             if token in doc_freq and token in self.idf:
@@ -97,119 +97,89 @@ class BM25Index:
                 numerator = tf * (self.k1 + 1)
                 denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / self.avg_doc_len)
                 score += idf * (numerator / denominator)
-        
         return score
-    
-    def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
-        """Search for top-k documents using BM25"""
-        scores = []
-        for doc_idx in range(len(self.documents)):
-            score = self.score(query, doc_idx)
-            scores.append((doc_idx, score))
-        
-        # Sort by score (descending) and return top-k
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
 
-class Stage1Retriever:
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
+        import heapq
+        query_tokens = self.tokenize(query)
+
+        # Collect only documents that contain at least one query token
+        candidate_indices: set = set()
+        for token in query_tokens:
+            if token in self.inverted_index:
+                for doc_idx, _ in self.inverted_index[token]:
+                    candidate_indices.add(doc_idx)
+
+        if not candidate_indices:
+            return []
+
+        # Score candidates only
+        scored = []
+        for doc_idx in candidate_indices:
+            s = self._score_doc(query_tokens, doc_idx)
+            if s > 0:
+                scored.append((s, doc_idx))
+
+        # Use heapq for O(N log k) top-k extraction
+        return [(doc_idx, s) for s, doc_idx in heapq.nlargest(top_k, scored)]
+
+class Stage1Retriever(BaseStage):
     """Stage 1: Fast Candidate Generation with Dense Embeddings + FAISS + Optional BM25"""
-    
+
     def __init__(self, config: Stage1Config):
+        super().__init__()
         self.config = config
-        self.logger = logging.getLogger(__name__)
-        
+
         # Initialize model
         self.model = None
         self.embedding_dim = None
-        
+
         # Initialize indexes
         self.faiss_index = None
         self.bm25_index = None
         self.documents = []
         self.doc_metadata = []
-        
+
         # Ensure directories exist
         os.makedirs(self.config.cache_dir, exist_ok=True)
         os.makedirs(self.config.index_dir, exist_ok=True)
-        
+
         self._load_model()
-    
+
     def _load_model(self):
         """Load the embedding model"""
         try:
             self.logger.info(f"Loading Stage 1 model: {self.config.model_name}")
-            
-            # Handle device selection
-            device = self.config.device
-            if device == "auto":
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            
-            # Prefer flattened local dir: <cache_dir>/<basename>, then legacy nested dir
-            base_dir = os.path.join(self.config.cache_dir, os.path.basename(self.config.model_name))
-            legacy_dir = os.path.join(self.config.cache_dir, self.config.model_name)
-            local_model_dir = base_dir if os.path.isdir(base_dir) else (legacy_dir if os.path.isdir(legacy_dir) else None)
-            model_source = local_model_dir or self.config.model_name
+
+            device = get_device(self.config.device)
+
+            def _load(name, dev):
+                src = resolve_model_path(name, self.config.cache_dir)
+                return SentenceTransformer(src, device=dev, cache_folder=self.config.cache_dir)
+
             try:
-                self.model = SentenceTransformer(
-                    model_source,
-                    device=device,
-                    cache_folder=self.config.cache_dir
-                )
+                self.model = _load(self.config.model_name, device)
             except Exception as e:
-                # Handle low memory / Windows paging file / CUDA OOM issues with graceful fallback
                 err_msg = str(e).lower()
                 low_mem_signatures = [
-                    "paging file is too small",
-                    "out of memory",
-                    "cuda out of memory",
-                    "os error 1455"
+                    "paging file is too small", "out of memory",
+                    "cuda out of memory", "os error 1455"
                 ]
                 if any(sig in err_msg for sig in low_mem_signatures):
-                    # If we were trying CUDA, first fall back to CPU with the same model
                     if device == "cuda":
-                        self.logger.warning(
-                            f"CUDA memory issue while loading '{self.config.model_name}': {e}. Falling back to CPU."
-                        )
+                        self.logger.warning(f"CUDA OOM loading '{self.config.model_name}': {e}. Falling back to CPU.")
                         device = "cpu"
                         try:
-                            self.model = SentenceTransformer(
-                                model_source,
-                                device=device,
-                                cache_folder=self.config.cache_dir
-                            )
-                        except Exception as e2:
-                            # If CPU also fails or model too large, fall back to a smaller model on CPU
-                            self.logger.warning(
-                                f"Failed to load original model on CPU as well: {e2}. "
-                                f"Falling back to lightweight model 'sentence-transformers/all-MiniLM-L6-v2'."
-                            )
+                            self.model = _load(self.config.model_name, device)
+                        except Exception:
+                            self.logger.warning(f"CPU also failed. Falling back to all-MiniLM-L6-v2.")
                             self.config.model_name = "sentence-transformers/all-MiniLM-L6-v2"
-                            base_dir = os.path.join(self.config.cache_dir, os.path.basename(self.config.model_name))
-                            legacy_dir = os.path.join(self.config.cache_dir, self.config.model_name)
-                            local_model_dir = base_dir if os.path.isdir(base_dir) else (legacy_dir if os.path.isdir(legacy_dir) else None)
-                            model_source = local_model_dir or self.config.model_name
-                            self.model = SentenceTransformer(
-                                model_source,
-                                device=device,
-                                cache_folder=self.config.cache_dir
-                            )
+                            self.model = _load(self.config.model_name, device)
                     else:
-                        # Not on CUDA; fall back to a smaller model on current device
-                        fallback_model = "sentence-transformers/all-MiniLM-L6-v2"
-                        self.logger.warning(
-                            f"Low-memory issue while loading '{self.config.model_name}': {e}. "
-                            f"Falling back to lightweight model '{fallback_model}'."
-                        )
-                        self.config.model_name = fallback_model
-                        base_dir = os.path.join(self.config.cache_dir, os.path.basename(self.config.model_name))
-                        legacy_dir = os.path.join(self.config.cache_dir, self.config.model_name)
-                        local_model_dir = base_dir if os.path.isdir(base_dir) else (legacy_dir if os.path.isdir(legacy_dir) else None)
-                        model_source = local_model_dir or self.config.model_name
-                        self.model = SentenceTransformer(
-                            model_source,
-                            device=device,
-                            cache_folder=self.config.cache_dir
-                        )
+                        fallback = "sentence-transformers/all-MiniLM-L6-v2"
+                        self.logger.warning(f"Low memory loading '{self.config.model_name}': {e}. Falling back to '{fallback}'.")
+                        self.config.model_name = fallback
+                        self.model = _load(self.config.model_name, device)
                 else:
                     raise
             
@@ -232,7 +202,7 @@ class Stage1Retriever:
         try:
             # Use FP16 if enabled and supported
             if self.config.use_fp16 and torch.cuda.is_available():
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     embeddings = self.model.encode(
                         texts,
                         batch_size=self.config.batch_size,
@@ -254,30 +224,27 @@ class Stage1Retriever:
             raise
     
     def _create_faiss_index(self, embeddings: np.ndarray):
-        """Create FAISS index for fast similarity search"""
+        """Create FAISS index for fast similarity search.
+
+        Uses HNSW for corpora >= hnsw_threshold (no training, fast, 98%+ recall).
+        Uses flat brute-force for smaller corpora.
+        """
         try:
-            d = embeddings.shape[1]  # embedding dimension
-            
-            # Use IVF index for better performance on large datasets
-            if len(embeddings) > 1000:
-                quantizer = faiss.IndexFlatIP(d)  # Inner product (cosine similarity)
-                self.faiss_index = faiss.IndexIVFFlat(quantizer, d, self.config.nlist, faiss.METRIC_INNER_PRODUCT)
-                
-                # Train the index
-                self.faiss_index.train(embeddings)
-                
-                # Add vectors to index
+            d = embeddings.shape[1]
+            n = len(embeddings)
+
+            if n >= self.config.hnsw_threshold:
+                # HNSW: no training needed, best speed/accuracy for 10k-100k+ docs
+                self.faiss_index = faiss.IndexHNSWFlat(d, self.config.hnsw_m, faiss.METRIC_INNER_PRODUCT)
+                self.faiss_index.hnsw.efSearch = self.config.hnsw_ef_search
+                self.faiss_index.hnsw.efConstruction = self.config.hnsw_ef_construction
                 self.faiss_index.add(embeddings)
-                
-                # Set nprobe for search
-                self.faiss_index.nprobe = self.config.nprobe
             else:
-                # For smaller datasets, use flat index
+                # Flat brute-force for small corpora (instant build)
                 self.faiss_index = faiss.IndexFlatIP(d)
                 self.faiss_index.add(embeddings)
-            
-            self.logger.info(f"FAISS index created with {len(embeddings)} vectors")
-            
+
+            self.logger.info(f"FAISS index created with {n} vectors (type: {type(self.faiss_index).__name__})")
         except Exception as e:
             self.logger.error(f"Error creating FAISS index: {e}")
             raise
@@ -299,7 +266,7 @@ class Stage1Retriever:
         self.documents.extend(documents)
         
         if metadata is None:
-            metadata = [{}] * len(documents)
+            metadata = [{} for _ in range(len(documents))]
         self.doc_metadata.extend(metadata)
         
         # Encode documents
@@ -310,6 +277,7 @@ class Stage1Retriever:
         if self.faiss_index is None:
             self._create_faiss_index(embeddings)
         else:
+            # HNSW and Flat both support sequential adds — no retrain needed
             self.faiss_index.add(embeddings)
         
         # Create or update BM25 index if enabled
@@ -366,49 +334,70 @@ class Stage1Retriever:
         return fused_results
     
     def search(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Search for documents using Stage 1 retrieval"""
+        """Search for documents using Stage 1 retrieval.
+
+        Dense (FAISS) and BM25 run **in parallel** when both are enabled,
+        since they are independent operations.
+        """
         if self.faiss_index is None:
             raise ValueError("No documents indexed. Call add_documents() first.")
         
         top_k = top_k or self.config.top_k_candidates
         
-        # Encode query
+        # Encode query (shared by both retrievers)
         query_embedding = self._encode_batch([query])
         query_embedding = self._normalize_embeddings(query_embedding)
-        
-        # Dense search with FAISS
-        dense_scores, dense_indices = self.faiss_index.search(query_embedding, top_k)
-        
-        # Convert to list of (doc_idx, score) tuples
-        dense_results = [(int(idx), float(score)) for idx, score in zip(dense_indices[0], dense_scores[0]) if idx >= 0]
-        
-        # BM25 search if enabled
-        bm25_results = []
-        if self.config.enable_bm25 and self.bm25_index is not None:
-            bm25_results = self.bm25_index.search(query, self.config.bm25_top_k)
+
+        # Run dense + BM25 in parallel
+        dense_results: List[Tuple[int, float]] = []
+        bm25_results: List[Tuple[int, float]] = []
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        futures = {}
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="stage1") as pool:
+            # Dense search
+            def _dense_search():
+                scores, indices = self.faiss_index.search(query_embedding, top_k)
+                return [(int(idx), float(s))
+                        for idx, s in zip(indices[0], scores[0]) if idx >= 0]
+            futures[pool.submit(_dense_search)] = "dense"
+
+            # BM25 search (if enabled)
+            if self.config.enable_bm25 and self.bm25_index is not None:
+                def _bm25_search():
+                    return self.bm25_index.search(query, self.config.bm25_top_k)
+                futures[pool.submit(_bm25_search)] = "bm25"
+
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    result = future.result()
+                    if name == "dense":
+                        dense_results = result
+                    else:
+                        bm25_results = result
+                except Exception as e:
+                    self.logger.error(f"Stage 1 {name} search failed: {e}")
         
         # Combine results
-        if self.config.enable_bm25 and bm25_results:
+        if bm25_results:
             if self.config.fusion_method == "rrf":
                 fused_results = self._reciprocal_rank_fusion(dense_results, bm25_results)
             else:  # weighted
                 fused_results = self._weighted_fusion(dense_results, bm25_results)
-            
-            # Take top-k from fused results
             final_results = fused_results[:top_k]
         else:
             final_results = dense_results[:top_k]
         
-        # Format results with metadata
+        # Format results
         results = []
         for doc_idx, score in final_results:
             if doc_idx < len(self.documents):
                 result = {
                     "doc_id": doc_idx,
                     "document": self.documents[doc_idx],
-                    # Keep legacy 'score' (stage 1 score) for compatibility
                     "score": score,
-                    # Also expose explicit Stage 1 score for downstream clarity
                     "stage1_score": score,
                     "metadata": self.doc_metadata[doc_idx],
                     "stage": "stage1"
@@ -471,6 +460,6 @@ class Stage1Retriever:
             "embedding_dimension": self.embedding_dim,
             "faiss_index_type": type(self.faiss_index).__name__ if self.faiss_index else None,
             "bm25_enabled": self.config.enable_bm25,
-            "bm25_vocabulary_size": len(self.bm25_index.vocabulary) if self.bm25_index else 0,
+            "bm25_vocabulary_size": len(self.bm25_index.inverted_index) if self.bm25_index else 0,
             "config": self.config.__dict__
         }

@@ -2,13 +2,13 @@
 """
 Simple HTML GUI for the TriStage Retrieval Pipeline (non-MCP)
 
-- Loads the non_mcp pipeline using AppConfig and the same stage classes from src/
+- Loads the non_mcp pipeline using AppConfig and the same stage classes from tristage_rag/
 - Provides:
   - HTML search page at /
   - JSON search API at /api/search
   - Endpoints to add documents from text form or file upload
 
-This does not modify src; it reuses the non_mcp ThreeStageRetrievalSystem directly.
+This does not modify tristage_rag; it reuses the non_mcp ThreeStageRetrievalSystem directly.
 """
 import os
 import sys
@@ -26,8 +26,7 @@ APP_DIR = Path(__file__).parent.resolve()
 NON_MCP_DIR = APP_DIR.parent.resolve()
 PROJECT_ROOT = NON_MCP_DIR.parent.resolve()
 
-# Ensure project root on path and set CWD so relative paths work
-os.chdir(PROJECT_ROOT)
+# Allow running directly without `pip install -e .`; no-op once installed.
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -498,6 +497,17 @@ def create_app() -> Flask:
     return app
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for the ``tristage-webui`` GUI script.
+
+    Sets the CWD to the repo root so relative paths (./models, ./faiss_index)
+    resolve correctly, then launches the Flask dev server.
+    """
+    import os
+    os.chdir(PROJECT_ROOT)
     app = create_app()
     app.run(host="127.0.0.1", port=5051, debug=False)
+
+
+if __name__ == "__main__":
+    main()

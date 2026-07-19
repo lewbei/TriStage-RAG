@@ -1,10 +1,8 @@
 import sys, py_compile
 files = [
- r'src/retrieval_pipeline.py',
- r'src/stage2_rescorer.py',
- r'src/stage3_reranker.py',
- r'src/mcp_retrieval_server.py',
- r'run_mcp_server.py',
+ r'tristage_rag/retrieval_pipeline.py',
+ r'tristage_rag/stage2_rescorer.py',
+ r'tristage_rag/stage3_reranker.py',
  r'run_benchmark.py',
 ]
 ok = True

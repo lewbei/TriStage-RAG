@@ -11,11 +11,8 @@ from pathlib import Path
 import sys
 from dataclasses import dataclass
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.retrieval_pipeline import RetrievalPipeline, PipelineConfig
-from src.stage3_reranker import AdaptiveCrossEncoderReranker, Stage3Config
+from tristage_rag.retrieval_pipeline import RetrievalPipeline, PipelineConfig
+from tristage_rag.stage3_reranker import AdaptiveCrossEncoderReranker, Stage3Config
 
 @dataclass
 class ModelCard:

@@ -18,11 +18,13 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-# Ensure "src" is importable whether run from repo root or elsewhere
+# Allow running directly without `pip install -e .`; no-op once installed.
 _THIS_FILE = Path(__file__).resolve()
-sys.path.append(str(_THIS_FILE.parents[1]))  # repo root
+_REPO_ROOT = _THIS_FILE.parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from src.retrieval_pipeline import RetrievalPipeline
+from tristage_rag.retrieval_pipeline import RetrievalPipeline
 
 
 def _read_text_file(p: Path) -> Optional[str]:

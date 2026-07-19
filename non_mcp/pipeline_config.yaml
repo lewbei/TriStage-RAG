@@ -10,14 +10,12 @@ pipeline:
   enable_timing: true
   save_intermediate_results: false
   auto_cleanup: true
-  max_memory_usage_gb: 4.0
-  
+
   # Stage 1: Fast Candidate Generation
   stage1:
     model: "google/embeddinggemma-300m"
     top_k: 50
     batch_size: 16
-    max_text_length: 512
     enable_bm25: true
     bm25_top_k: 100
     fusion_method: "rrf"  # "rrf" or "weighted"
@@ -26,9 +24,12 @@ pipeline:
     rrf_k: 60
     dense_weight: 0.7
     bm25_weight: 0.3
-    # FAISS parameters
-    nlist: 100  # IVF clusters
-    nprobe: 10  # search probes
+    # FAISS parameters — Stage 1 uses IndexFlatIP for corpora < hnsw_threshold
+    # and IndexHNSWFlat for larger corpora (no training step required).
+    hnsw_m: 32                  # HNSW connections per vector
+    hnsw_ef_search: 128         # HNSW search-time precision
+    hnsw_ef_construction: 200   # HNSW build-time precision
+    hnsw_threshold: 10000       # Switch from Flat to HNSW at this corpus size
     
   # Stage 2: Multi-Vector Rescoring
   stage2:

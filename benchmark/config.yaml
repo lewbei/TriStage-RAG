@@ -37,12 +37,12 @@ benchmark:
       use_fp16: true
       low_memory_alternative: "sentence-transformers/all-MiniLM-L6-v2"
       
-    # Stage 2: ColBERT Reranking Model  
+    # Stage 2: ColBERT Reranking Model
     stage2:
       model: "lightonai/GTE-ModernColBERT-v1"
       description: "Stage 2: ColBERT reranking model"
       gated: false
-      top_k: 100
+      top_k: 50   # k=50 beats k=500 per the SemEval-2026 finding (papers/2605.12028v1.pdf)
       batch_size: 16
       max_seq_length: 192
       use_fp16: true
@@ -80,7 +80,6 @@ benchmark:
     enable_timing: true
     log_memory_usage: true
     log_gpu_stats: true
-    max_memory_usage_gb: 4.0
     
   # Error handling and recovery
   error_handling:

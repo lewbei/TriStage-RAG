@@ -13,14 +13,12 @@ from pathlib import Path
 import sys
 from dotenv import load_dotenv
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent))
-
-# Import our custom model and tasks
-from tristage_mteb_model import TriStageMTEBModel
-from limit_mteb_tasks import LIMITSmallRetrieval, LIMITRetrieval
-from download_limit_dataset import LIMITDatasetDownloader
-from download_models import ModelDownloader
+# Import our custom model and tasks (package-relative so this works both as
+# `python -m benchmark.run_mteb_evaluation` and via the installed package).
+from benchmark.tristage_mteb_model import TriStageMTEBModel
+from benchmark.limit_mteb_tasks import LIMITSmallRetrieval, LIMITRetrieval
+from benchmark.download_limit_dataset import LIMITDatasetDownloader
+from benchmark.download_models import ModelDownloader
 
 # Try to import MTEB
 try:

@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tristage-rag"
+dynamic = ["version"]
+description = "A theoretically-grounded 3-stage retrieval pipeline (dense+BM25 → ColBERT MaxSim → cross-encoder), optimized for 4GB VRAM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lewbei" }]
+keywords = ["rag", "retrieval", "colbert", "reranking", "faiss", "bm25"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "sentence-transformers>=2.0.0",
+    "torch>=2.0.0",
+    "numpy>=1.21.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "faiss-cpu>=1.7.0",
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+    "huggingface-hub>=0.17.0",
+    "requests>=2.28.0",
+    "structlog>=22.0.0",
+]
+
+[project.optional-dependencies]
+benchmark = [
+    "mteb==2.0.1",
+    "datasets>=2.14.0",
+    "scikit-learn>=1.3.0",
+    "pandas>=2.0.0",
+]
+webui = [
+    "Flask>=3.0.0",
+    "pypdf>=4.0.0",
+    "python-docx>=1.0.0",
+    "sentencepiece>=0.1.99",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+all = [
+    "tristage-rag[benchmark,webui,dev]",
+]
+
+[project.scripts]
+# One-click benchmark: dataset + model download + MTEB evaluation.
+tristage-benchmark = "run_benchmark:main"
+
+[project.gui-scripts]
+# Flask web UI (search / chat / embed), binds to 127.0.0.1:5051.
+tristage-webui = "non_mcp.webui.app:main"
+
+[project.urls]
+Documentation = "https://github.com/lewbei/TriStage-RAG#readme"
+Source = "https://github.com/lewbei/TriStage-RAG"
+Issues = "https://github.com/lewbei/TriStage-RAG/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "tristage_rag.__version__.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "tristage_rag*",
+    "benchmark*",
+    "non_mcp*",
+]
+exclude = ["tests*", "models*", "faiss_index*", "ab_runs*", "papers*", "research*", "docs*", "mcp*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+markers = [
+    "slow: integration tests that download and run real models (skip with: -m 'not slow')",
+]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

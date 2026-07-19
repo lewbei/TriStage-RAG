@@ -25,17 +25,19 @@ import time
 import pickle
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import logging
 
-# Add src to path for pipeline components (use parent directory since we're in non_mcp folder)
-sys.path.append(str(Path(__file__).parent.parent))
+# Allow running directly without `pip install -e .`; no-op once installed.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Import pipeline components
-from src.stage1_retriever import Stage1Retriever, Stage1Config
-from src.stage2_rescorer import ColBERTScorer, Stage2Config
-from src.stage3_reranker import CrossEncoderReranker, Stage3Config
+from tristage_rag.stage1_retriever import Stage1Retriever, Stage1Config
+from tristage_rag.stage2_rescorer import ColBERTScorer, Stage2Config
+from tristage_rag.stage3_reranker import CrossEncoderReranker, Stage3Config
 
 
 @dataclass
@@ -172,11 +174,11 @@ class ThreeStageRetrievalSystem:
                 top_k_candidates=100,
                 batch_size=16,
                 enable_bm25=self.config.enable_bm25,
-                use_fp16=False
+                use_fp16=True
             )
             self.stage1 = Stage1Retriever(stage1_config)
             self.logger.info("Stage 1 initialized successfully")
-            
+
             # Stage 2: Multi-vector rescoring
             stage2_config = Stage2Config(
                 model_name="lightonai/GTE-ModernColBERT-v1",
@@ -185,7 +187,7 @@ class ThreeStageRetrievalSystem:
                 top_k_candidates=50,
                 batch_size=8,
                 max_seq_length=192,
-                use_fp16=False
+                use_fp16=True
             )
             self.stage2 = ColBERTScorer(stage2_config)
             self.logger.info("Stage 2 initialized successfully")
@@ -198,7 +200,7 @@ class ThreeStageRetrievalSystem:
                 top_k_final=self.config.max_results,
                 batch_size=16,
                 max_length=256,
-                use_fp16=False
+                use_fp16=True
             )
             self.stage3 = CrossEncoderReranker(stage3_config)
             self.logger.info("Stage 3 initialized successfully")
@@ -241,7 +243,7 @@ class ThreeStageRetrievalSystem:
 
         return new_count
     
-    def search(self, query: str, top_k: int = None) -> Dict[str, Any]:
+    def search(self, query: str, top_k: Optional[int] = None) -> Dict[str, Any]:
         """Perform 3-stage search"""
         if top_k is None:
             top_k = self.config.max_results
@@ -484,8 +486,8 @@ class CommandLineInterface:
                             documents.extend([str(d) for d in data if d])
                         elif isinstance(data, dict) and 'text' in data:
                             documents.append(data['text'])
-                    except:
-                        pass
+                    except Exception as e:
+                        logging.warning(f"Skipping malformed JSON file: {e}")
             
             count = self.system.add_documents(documents, source=dirpath)
             print(f"Loaded {count} documents from {dirpath}")

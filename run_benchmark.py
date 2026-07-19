@@ -10,11 +10,8 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent))
-sys.path.append(str(Path(__file__).parent / "benchmark"))
-
-# Import required modules
+# Import required modules (the repo is pip-installable via `pip install -e .[all]`;
+# no sys.path manipulation needed).
 from benchmark.download_limit_dataset import LIMITDatasetDownloader
 from benchmark.download_models import ModelDownloader
 from benchmark.config_loader import BenchmarkConfig
