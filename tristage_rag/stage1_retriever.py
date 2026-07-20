@@ -165,6 +165,15 @@ class Stage1Retriever(BaseStage):
                     "paging file is too small", "out of memory",
                     "cuda out of memory", "os error 1455"
                 ]
+                # Also fall back when the model is gated / unreachable without
+                # auth (e.g. google/embeddinggemma-300m). Failing the whole
+                # pipeline here would make the default RetrievalPipeline()
+                # unusable for anyone without an HF token — silently fall back
+                # to the public all-MiniLM-L6-v2 instead.
+                auth_signatures = [
+                    "gatedrepoerror", "gated repo", "unauthorized",
+                    "401 client error", "403 client error", "access is restricted",
+                ]
                 if any(sig in err_msg for sig in low_mem_signatures):
                     if device == "cuda":
                         self.logger.warning(f"CUDA OOM loading '{self.config.model_name}': {e}. Falling back to CPU.")
@@ -180,6 +189,15 @@ class Stage1Retriever(BaseStage):
                         self.logger.warning(f"Low memory loading '{self.config.model_name}': {e}. Falling back to '{fallback}'.")
                         self.config.model_name = fallback
                         self.model = _load(self.config.model_name, device)
+                elif any(sig in err_msg for sig in auth_signatures):
+                    fallback = "sentence-transformers/all-MiniLM-L6-v2"
+                    self.logger.warning(
+                        f"Cannot access gated/restricted model '{self.config.model_name}' "
+                        f"(set HUGGING_FACE_HUB_TOKEN to use it): {e}. "
+                        f"Falling back to '{fallback}'."
+                    )
+                    self.config.model_name = fallback
+                    self.model = _load(self.config.model_name, device)
                 else:
                     raise
             

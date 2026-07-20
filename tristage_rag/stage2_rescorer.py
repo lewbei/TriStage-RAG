@@ -211,13 +211,22 @@ class ColBERTScorer(BaseStage):
         return (quantized, scale.squeeze(-1).float())
 
     def _dequantize(self, cached: Tuple) -> torch.Tensor:
-        """Restore embeddings from cache (float32, float16, or int8 tuple)."""
-        if isinstance(cached, tuple) and len(cached) == 2 and cached[0].dtype == torch.int8:
+        """Restore embeddings from cache (float32, float16, or int8 tuple).
+
+        ``cached`` is the full cache entry: ``(emb_or_tuple, seq_len)``. The
+        embedding part may itself be a tuple ``(int8_tensor, scale_vec)`` when
+        int8 precision is used.
+        """
+        emb_or_tuple, _seq_len = cached  # strip the seq_len metadata
+        if (
+            isinstance(emb_or_tuple, tuple)
+            and len(emb_or_tuple) == 2
+            and emb_or_tuple[0].dtype == torch.int8
+        ):
             # Int8 quantized: (int8_tensor, scale_vec) → float32
-            quantized, scale = cached
+            quantized, scale = emb_or_tuple
             return quantized.float() * scale.unsqueeze(-1)
-        emb, _ = cached
-        return emb.float()
+        return emb_or_tuple.float()
 
     def remove_documents(self, doc_ids: List[int]):
         """Remove cached embeddings for the given document IDs."""

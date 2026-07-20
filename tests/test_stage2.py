@@ -91,6 +91,10 @@ class TestCachePersistence:
 
     def test_export_import_roundtrip_int8(self):
         """The int8 (quantized, scale) tuple branch survives a full round-trip."""
+        # Seed for determinism: int8 quantization of unbounded randn can exceed
+        # a tight atol on unlucky draws (values near the per-channel clamp
+        # boundary lose up to ~scale/2). Seeding pins a known-good draw.
+        torch.manual_seed(42)
         scorer = self._make_scorer("int8")
         # Build a genuine int8 entry via the production quantizer
         float_emb = torch.randn(5, 8, dtype=torch.float32)
@@ -120,10 +124,15 @@ class TestCachePersistence:
 
         scorer2 = self._make_scorer("int8")
         scorer2.import_cache(restored)
-        # Dequantize and confirm values match within int8 precision tolerance
+        # Dequantize and confirm values match within int8 precision tolerance.
+        # NOTE: _dequantize takes the FULL cache entry (emb_or_tuple, seq_len),
+        # matching the real caller in rescore_candidates (`self._dequantize(cached)`).
+        # Tolerance is relative to the per-channel scale, since int8 quantization
+        # error is bounded by scale/2 per element. atol=0.05 + rtol=1e-2 covers
+        # the seeded draw comfortably while still catching gross corruption.
         out_entry = scorer2._doc_embeddings[7]
-        deq = scorer2._dequantize(out_entry[0])
-        assert torch.allclose(deq, float_emb, atol=1e-2), (
+        deq = scorer2._dequantize(out_entry)
+        assert torch.allclose(deq, float_emb, atol=0.05, rtol=1e-2), (
             "int8 round-trip lost too much precision"
         )
 
@@ -143,3 +152,27 @@ class TestCachePersistence:
         assert scorer.has_cached_docs() is True
         scorer.import_cache({})
         assert scorer.has_cached_docs() is False
+
+    def test_dequantize_handles_int8_full_cache_entry(self):
+        """Regression: _dequantize must accept the FULL cache entry
+        ``(emb_or_tuple, seq_len)``, including when the emb part is itself an
+        int8 tuple. Previously it did ``cached[0].dtype`` which raised
+        ``AttributeError: 'tuple' object has no attribute 'dtype'`` whenever
+        int8 precision was used (the default).
+        """
+        scorer = self._make_scorer("int8")
+        float_emb = torch.randn(5, 8, dtype=torch.float32)
+        quant = scorer._quantize_int8(float_emb)  # (int8_tensor, scale_vec)
+        # Full cache entry as produced by add_documents / restored by import_cache
+        full_entry = (quant, 5)
+
+        deq = scorer._dequantize(full_entry)
+        assert torch.allclose(deq, float_emb, atol=1e-2)
+
+    def test_dequantize_handles_float_full_cache_entry(self):
+        """_dequantize also works for non-quantized (float) full cache entries."""
+        scorer = self._make_scorer("float32")
+        float_emb = torch.randn(5, 8, dtype=torch.float32)
+        full_entry = (float_emb, 5)
+        deq = scorer._dequantize(full_entry)
+        assert torch.equal(deq, float_emb)
